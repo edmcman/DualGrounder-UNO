@@ -6,10 +6,44 @@ Created on Fri Jan 10 14:19:04 2020
 """
 
 import clingo
-import clingo_ast_util as cau
+from clingo.ast import ASTType, Sign, ProgramBuilder, parse_string, parse_files, Variable, Location, Position
 from typing import List
-from clingo.ast import ASTType
 import argparse
+
+def is_rule(node):
+    return isinstance(node, clingo.ast.AST) and node.ast_type == ASTType.Rule
+
+def get_head_literals(rule):
+    if rule.head.ast_type == ASTType.Disjunction:
+        return [el.literal for el in rule.head.elements]
+    return [rule.head]
+
+def is_constraint(rule):
+    return is_rule(rule) and str(get_head_literals(rule)[0]) == '#false'
+
+_ANON_LOC = Location(begin=Position(filename='<string>', line=1, column=1),
+                     end=Position(filename='<string>', line=1, column=1))
+
+def rename_anon_vars(node, counter=0):
+    """Replace _ (anonymous) variables with uniquely named variables."""
+    if not isinstance(node, clingo.ast.AST):
+        return node, counter
+    if node.ast_type == ASTType.Variable and node.name == '_':
+        return Variable(location=_ANON_LOC, name=f'_V{counter}'), counter + 1
+    kwargs = {}
+    for key in getattr(node, 'child_keys', []):
+        child = getattr(node, key)
+        if isinstance(child, clingo.ast.ASTSequence):
+            new_items = []
+            for item in child:
+                new_item, counter = rename_anon_vars(item, counter)
+                new_items.append(new_item)
+            kwargs[key] = new_items
+        elif isinstance(child, clingo.ast.AST):
+            new_child, counter = rename_anon_vars(child, counter)
+            if new_child is not child:
+                kwargs[key] = new_child
+    return (node.update(**kwargs), counter) if kwargs else (node, counter)
 
 '''
   Observer, collects modeling data when the grounder is run
@@ -81,7 +115,7 @@ class DualGrounder():
         
         trialPRG = self.constraints + self.constraint_additions
     
-        with self.auxControl.builder() as b:
+        with ProgramBuilder(self.auxControl) as b:
                 for r in trialPRG:
                     b.add(r)
                     
@@ -99,7 +133,7 @@ class DualGrounder():
         
         mainatoms = self.base + self.base_additions
         
-        with self.mainControl.builder() as b:
+        with ProgramBuilder(self.mainControl) as b:
             for r in mainatoms:
                 #print(r)
                 b.add(r)
@@ -109,52 +143,35 @@ class DualGrounder():
         self.mainControl.add(progname, [], constraintstr)
         self.mainControl.ground([(progname,[])])
     
-    # Created by Brian Hodges, this is fed into the read method to take rules out of ASP programs.
-    def arg_read_filter(self, rule):
-        '''
-        This method should be passed into clingo.parse_program as a callback
-        '''
-        if cau.is_rule(rule):
-            self.prg.append(rule)
+    def arg_read_filter(self, node):
+        if is_rule(node):
+            self.prg.append(node)
+        elif node.ast_type in (ASTType.Defined, ASTType.ShowSignature, ASTType.ShowTerm, ASTType.Minimize, ASTType.Program, ASTType.External, ASTType.Heuristic, ASTType.Edge, ASTType.ProjectAtom):
+            self.prg.append(node)
 
-    # Created by Brian Hodges, this is called to read a string into a program.
     def read(self, program):
-        '''
-        Takes a program as a string and reads it into a string list
-        '''
-        clingo.parse_program(program, self.arg_read_filter)
+        parse_string(program, self.arg_read_filter)
         return self.prg
-    
-    # This method is used to read programs into a list passed via parameter.
+
+    def read_files(self, files):
+        parse_files(files, self.arg_read_filter)
+        return self.prg
+
     def read_ext(self, program, output):
-        '''
-        Takes a program as a string and reads it into the given String list
-        '''
-        clingo.parse_program(program, (lambda rule : output.append(rule) if cau.is_rule(rule) else None))
-    
-    def split_filter(self, rule):
-        '''
-        This method should be passed into clingo.parse_program as a callback
-        
-        Written by Brian Hodges
-        Modified by Justin Robbins
-        '''
-        
-        if cau.is_rule(rule) and str(cau.get_head_literals(rule)[0]) == '#false':
-            self.constraints.append(rule)
+        parse_string(program, (lambda node : output.append(node) if is_rule(node) else None))
+
+    def split_filter(self, node):
+        if is_constraint(node):
+            self.constraints.append(node)
         else:
-            self.base.append(rule)
-            
+            self.base.append(node)
+
     def split(self, program):
-        '''
-        Takes a program as a string and separates it into a base and lazy constraints
-        Returns a tuple of the base program and constraints as lists of parsed rules
-        (base, constrints)
-        
-        Written by Brian Hodges
-        '''
-        #print(program)
-        clingo.parse_program(program, self.split_filter)
+        parse_string(program, self.split_filter)
+        return self.base, self.constraints
+
+    def split_files(self, files):
+        parse_files(files, self.split_filter)
         return self.base, self.constraints
     
     '''
@@ -188,60 +205,41 @@ class DualGrounder():
     '''
     def constraints_to_ndj_rules(self, constraints):
         prgstr = ""
-        # For each rule in the given rules list,
         for c in constraints:
+            c, _ = rename_anon_vars(c)
             headpred = []
             body = []
             args = []
-            # Collect the arguments of the rule
-            # If it is a constraint rule,
-            if cau.is_rule(c) and str(cau.get_head_literals(c)[0]) == '#false':
-                # For each body literal in the constraint rule,
+            if is_constraint(c):
                 for lit in c.body:
-                    if lit.atom.type in [ASTType.SymbolicAtom, ASTType.Function, ASTType.Literal]:
-                        for arg in cau.get_arguments(lit):
+                    if lit.atom.ast_type == ASTType.SymbolicAtom:
+                        for arg in lit.atom.symbol.arguments:
                             if arg not in args:
                                 args.append(arg)
             else:
                 continue
-            
+
             if len(args) > 10:
-                # Too many arguments to encode
-                print("Too many argument to encode in constraint" + str(c) + ".")
+                print("Too many arguments to encode in constraint" + str(c) + ".")
                 continue
-            
-            # After collecting arguments create rule.
-            # For each literal in the body,
+
             for lit in c.body:
-                # Add literal to transformed rule's body.
                 body.append(str(lit))
-                if lit.atom.type in [ASTType.SymbolicAtom, ASTType.Function, ASTType.Literal]:
-                    # If literal is transformable, transform to add to the head of the transformed rule.
+                if lit.atom.ast_type == ASTType.SymbolicAtom:
                     headstr = ""
-                    
-                    # Add not to pred string if needed
-                    if not cau.is_positive(lit):
+                    if lit.sign != Sign.NoSign:
                         headstr += "not'"
-                    
-                    # Add the literal's predicate name to its head representation
-                    lpred = cau.get_predicate_symbol(lit)
-                    headstr += lpred.name() + "'"
-                    
-                    # Add numbers corresponding to the literal's argument's indices in the args list
-                    for arg in cau.get_arguments(lit):
+                    headstr += lit.atom.symbol.name + "'"
+                    for arg in lit.atom.symbol.arguments:
                         idx = args.index(arg)
                         headstr += str(idx)
-                    
-                    # Append literal's head representation to the list of all of them.
                     headpred.append(headstr)
-            
+
             headargs = "(" + ",".join(str(arg) for arg in args) + ")"
             new_rule = "_".join(headpred) + "'" + headargs + ":-" + ",".join(body) + "."
             prgstr += new_rule
-            #print(new_rule)
-        
+
         self.constraints = []
-        #Read transformed rules into AST rules for AuxGrounding
         self.read_ext(prgstr, self.constraints)
 
     '''
@@ -383,60 +381,33 @@ def main():
     dg = None
     
     if not args.splitprog:
-        '''Combine text files and separate constraints into AuxGrounder. Default Behavior.'''
-        '''read program text from input files'''
-        program = ''
-        for filename in args.files:
-            with open(filename, 'r') as f:
-                program += f.read() + '\n\n' 
-        
         dg = DualGrounder()
-        dg.read(program)
-        
-        '''Split read program into non-constraint and constraint rules.'''
-        base, constraints = dg.split(program)
-        
-        '''Transform constraints into disjunctive rules'''
-        dg.constraints_to_rules(constraints)
+        dg.read_files(args.files)
+        base, constraints = dg.split_files(args.files)
+        dg.constraints_to_ndj_rules(constraints)
     else:
-        '''Puts files into MainGrounder and the last into AuxGrounder. The last file must be exclusively constraint rules.'''
-        mainprogram = ''
-        auxprogram = ''
-        i = 0
-        for filename in args.files:
-            with open(filename, 'r') as f:
-                if i+1 < len(args.files):
-                    mainprogram += f.read() + '\n\n' 
-                else:
-                    auxprogram += f.read() + '\n\n'
-            i += 1
-        
         dg = DualGrounder()
         mainprglst = []
-        dg.read_ext(mainprogram, mainprglst)
-        
+        parse_files(args.files[:-1], (lambda node : mainprglst.append(node)))
+
         auxprglst = []
-        dg.read_ext(auxprogram, auxprglst)
-        
-        '''Ensure given rules are valid'''
+        parse_files([args.files[-1]], (lambda node : auxprglst.append(node)))
+
         dg.prg = mainprglst + auxprglst
-        
+
         for rule in mainprglst:
-            if not cau.is_rule(rule):
+            if not is_rule(rule):
                 print("Invalid rule given in main input program! Exiting...")
                 exit()
-        
+
         dg.base = mainprglst
-        
-        '''Ensure secondary rules are valid constraints'''
+
         for rule in auxprglst:
-            if not cau.is_rule(rule) or not str(cau.get_head_literals(rule)[0]) == '#false':
+            if not is_constraint(rule):
                 print("Invalid or non-constraint rule given in a secondary input program! Exiting...")
                 exit()
-                
+
         dg.constraints = auxprglst
-        
-        '''Transform constraints into disjunctive rules'''
         dg.constraints_to_ndj_rules(auxprglst)
     
     # Use wasplike args for clingo if specified.
