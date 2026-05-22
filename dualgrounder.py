@@ -137,7 +137,7 @@ class DualGrounder():
         with ProgramBuilder(self.mainControl) as b:
             for r in mainatoms:
                 b.add(r)
-        self.mainControl.configuration.solve.models = models
+        self.mainControl.configuration.solve.models = 1
         if time_limit > 0:
             self.mainControl.configuration.solve.limit = f"umax,{time_limit}"
     
@@ -192,11 +192,9 @@ class DualGrounder():
 
         if not self.last_grounded_constraints:
             self._found_models.append((self.last_main_model, list(self.last_main_atoms), list(model.cost)))
-            if 0 < self._target <= len(self._found_models):
-                return False  # stop solving, have enough valid models
         else:
             self._invalid_triggered = True
-            return False  # stop solving, need to inject lazy constraints
+        return False  # always stop after one model; outer loop handles restart
     
     '''
       Used by callback methods to print the solved model.
@@ -467,11 +465,18 @@ def main():
             return
 
         dg._invalid_triggered = False
+        prev_valid_count = len(dg._found_models)
 
         if iterint != 0:
             dg.update_mainControl("Iteration_" + str(iterint-1), lastcstr)
         else:
             dg.mainControl.ground([("base", [])])
+
+        # Enforce that subsequent models are at least as good as the best found so far
+        if dg._found_models:
+            best_cost = dg._found_models[-1][2]
+            if best_cost:
+                dg.mainControl.configuration.solve.opt_bound = ",".join(str(c) for c in best_cost)
 
         dprint("\nMain Solving:")
         dg.mainControl.solve(on_model=dg.main_callback)
@@ -479,14 +484,22 @@ def main():
         dprint("\nMain Program Answer Set:")
         dprint(dg.last_main_atoms)
 
-        if not dg._invalid_triggered:
-            # Clingo exhausted models (or hit target/time limit) without an invalid model
-            break
+        found_new_valid = len(dg._found_models) > prev_valid_count
 
-        # An invalid model triggered a restart; add lazy constraints and block already-found models
-        lastcstr = dg.build_base_additions()
-        for _, atoms, _ in dg._found_models:
-            lastcstr += ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
+        if found_new_valid:
+            if 0 < dg._target <= len(dg._found_models):
+                break  # collected enough valid models
+            # Need more: block this exact model; opt_bound enforces cost non-regression
+            _, atoms, _ = dg._found_models[-1]
+            lastcstr = ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
+        elif dg._invalid_triggered:
+            # Invalid model: add lazy constraints, re-block all already-found valid models
+            lastcstr = dg.build_base_additions()
+            for _, atoms, _ in dg._found_models:
+                lastcstr += ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
+        else:
+            # No model found — exhausted or UNSAT
+            break
         dprint("\nGenerated constraint program")
         dprint(lastcstr)
 
