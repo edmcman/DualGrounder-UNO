@@ -391,7 +391,7 @@ def main():
     parser.add_argument('--debugprint', action='store_true', default=False, help='Whether or not the system prints runtime data.')
     parser.add_argument('--splitprog', action='store_true', default=False, help='If true, the system will load the first program files into the main grounder and the last into the auxgrounder. Last program should be exclusively constraint rules.')
     parser.add_argument('--wasplike', action='store_true', default=False, help='If true, the system will use wasp-like heuristics for its clingo solving.')
-    parser.add_argument('--models', type=int, default=1, help='Number of models to find (0 = all, default 1).')
+    parser.add_argument('--models', type=int, default=0, help='Number of models to find (0 = all, default 0).')
     parser.add_argument('--time-limit', type=int, default=0, dest='time_limit', help='Wall-clock time limit in seconds (0 = no limit).')
     parser.add_argument('--max-time', type=float, default=0, dest='max_time', help='Overall wall-clock time limit in seconds (0 = no limit).')
     args = parser.parse_args()
