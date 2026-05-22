@@ -9,6 +9,7 @@ import clingo
 from clingo.ast import ASTType, Sign, ProgramBuilder, parse_string, parse_files, Variable, Location, Position
 from typing import List
 import argparse
+import time
 
 def is_rule(node):
     return isinstance(node, clingo.ast.AST) and node.ast_type == ASTType.Rule
@@ -124,20 +125,21 @@ class DualGrounder():
     '''
     Resets the main observer and MainGrounder with the constraints created in previous cycles.
     '''
-    def init_mainControl(self, cargs=['--warn=none']):
+    def init_mainControl(self, cargs=['--warn=none'], models=0, time_limit=0):
         self.mainObserver.reset_observer()
         self.mainControl = clingo.Control(cargs)
         self.mainControl.register_observer(self.mainObserver)
         self.last_main_model = None
         self.last_main_atoms = None
-        
+
         mainatoms = self.base + self.base_additions
-        
+
         with ProgramBuilder(self.mainControl) as b:
             for r in mainatoms:
-                #print(r)
                 b.add(r)
-        self.mainControl.configuration.solve.models=1
+        self.mainControl.configuration.solve.models = models
+        if time_limit > 0:
+            self.mainControl.configuration.solve.limit = f"umax,{time_limit}"
     
     def update_mainControl(self, progname, constraintstr):
         self.mainControl.add(progname, [], constraintstr)
@@ -182,6 +184,19 @@ class DualGrounder():
         self.last_main_model = model.symbols(shown=True)
         self.last_main_atoms = model.symbols(atoms=True)
         self.on_model(model)
+
+        self.build_aux_additions()
+        self.init_auxControl(self._cargs)
+        self.auxControl.ground([("base", [])])
+        self.extract_grounded_aux_constraints()
+
+        if not self.last_grounded_constraints:
+            self._found_models.append((self.last_main_model, list(self.last_main_atoms), list(model.cost)))
+            if 0 < self._target <= len(self._found_models):
+                return False  # stop solving, have enough valid models
+        else:
+            self._invalid_triggered = True
+            return False  # stop solving, need to inject lazy constraints
     
     '''
       Used by callback methods to print the solved model.
@@ -376,10 +391,13 @@ def main():
     parser.add_argument('--debugprint', action='store_true', default=False, help='Whether or not the system prints runtime data.')
     parser.add_argument('--splitprog', action='store_true', default=False, help='If true, the system will load the first program files into the main grounder and the last into the auxgrounder. Last program should be exclusively constraint rules.')
     parser.add_argument('--wasplike', action='store_true', default=False, help='If true, the system will use wasp-like heuristics for its clingo solving.')
+    parser.add_argument('--models', type=int, default=1, help='Number of models to find (0 = all, default 1).')
+    parser.add_argument('--time-limit', type=int, default=0, dest='time_limit', help='Wall-clock time limit in seconds (0 = no limit).')
+    parser.add_argument('--max-time', type=float, default=0, dest='max_time', help='Overall wall-clock time limit in seconds (0 = no limit).')
     args = parser.parse_args()
-    
+
     dg = None
-    
+
     if not args.splitprog:
         dg = DualGrounder()
         dg.read_files(args.files)
@@ -409,117 +427,83 @@ def main():
 
         dg.constraints = auxprglst
         dg.constraints_to_ndj_rules(auxprglst)
-    
-    # Use wasplike args for clingo if specified.
+
     cargs = ['--warn=none']
     if args.wasplike:
         cargs = ['--warn=none', '--trans-ext=no', '--eq=0', '--sat-prepro=2', '--heuristic=Vsids', '--no-init-moms', '--sign-def=neg', '--rand-freq=no', '--update-lbd=glucose', '--restarts=D,10000,0.8', '--block-restarts=10000,1.4,2000', '--deletion=sort,50,mixed', '--del-glue=4']
-    
-    # Initialize cycle values
+
+    dg._cargs = cargs
+    dg._target = args.models
+    dg._found_models = []
+
     iterint = 0
     lim = args.iterlim
     if lim == 0:
         lim = float("inf")
-    
-    
+
     dprint("\nMain Program:")
     dprint(dg.base)
-    
     dprint("\nAux Program:")
     dprint(dg.constraints)
-    '''
-    import sys
-    sys.exit("Rule test over.")
-    '''
-    dg.init_mainControl(cargs)
+
+    dg.init_mainControl(cargs, models=args.models, time_limit=args.time_limit)
+    start_time = time.monotonic()
+    deadline = (start_time + args.max_time) if args.max_time > 0 else None
     lastcstr = ""
-    while(True):
+    while True:
         dprint("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        '''
-            Initialize MainGrounder with base program and past generated constraints.
-            Grounds and solves the resulting program.
-        '''
         dprint("Iteration " + str(iterint) + ": ")
-        
         dprint("\nBase Program w/ Additions: ")
         dprint(dg.base + dg.base_additions)
-        
+
+        if deadline is not None and time.monotonic() >= deadline:
+            print("TIMEOUT")
+            if dg._found_models:
+                for i, (model, _, cost) in enumerate(dg._found_models):
+                    print(f"\nAnswer: {i + 1}")
+                    print(model)
+                    if cost:
+                        print("Optimization:", " ".join(str(c) for c in cost))
+            return
+
+        dg._invalid_triggered = False
+
         if iterint != 0:
             dg.update_mainControl("Iteration_" + str(iterint-1), lastcstr)
         else:
-            dg.mainControl.ground([("base",[])])
-        
+            dg.mainControl.ground([("base", [])])
+
         dprint("\nMain Solving:")
         dg.mainControl.solve(on_model=dg.main_callback)
-        
+
         dprint("\nMain Program Answer Set:")
         dprint(dg.last_main_atoms)
-        
-        '''
-            If no answer set has been generated by the MainGrounder, there is no answer 
-                set that satisfies both parts of the original program.
-        '''
-        if dg.last_main_model == None:
-            dprint("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-            print("Ran out of models, aux constraints not satisified.")
-            dprint("")
+
+        if not dg._invalid_triggered:
+            # Clingo exhausted models (or hit target/time limit) without an invalid model
             break
-        
-        '''
-            Builds Aux program from the transformed constraints and the atoms in the main program's answer set.
-            The resulting program is them grounded and solved.
-        '''
-        dg.build_aux_additions()
-        dg.init_auxControl(cargs)
-        
-        dprint("\nAux Program: ")
-        dprint(dg.constraints)
-        
-        dprint("\nConstraint Program w/ Additions:")
-        dprint(dg.constraints + dg.constraint_additions)
-        
-        dg.auxControl.ground([("base",[])])
-        
-        dprint("\nAux Observer Atoms:")
-        dprint(dg.auxObserver.atoms)
-        
-        dg.extract_grounded_aux_constraints()
-        
-        '''
-            If none of the transformed constraints were grounded, 
-            an answer set for both sub programs has been found, and the program exits returning this model.
-        '''
-        if not dg.last_grounded_constraints:
-            dprint("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-            dprint("")
-            print("\nSolution found after " + str(iterint) + " iterations:")
-            print(dg.last_main_model)
-            dprint("")
-            break
-        
-        '''
-            If a solution wasn't found, constraints are generated to eliminate the failed answer set from the MainGrounder.
-        '''
+
+        # An invalid model triggered a restart; add lazy constraints and block already-found models
         lastcstr = dg.build_base_additions()
-        dprint("\n Generated constraint program")
+        for _, atoms, _ in dg._found_models:
+            lastcstr += ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
+        dprint("\nGenerated constraint program")
         dprint(lastcstr)
-        '''
-        for c in dg.build_base_additions():
-            dprint("\ninserting:")
-            dprint(c)
-            addedconstraintcount += 1
-            dg.base_additions.append(c)
-        dprint("Current number of added constraints: " + str(addedconstraintcount))
-        '''
-        '''
-            System to preemptively end the DualGrounder after a prespecified amount of cycles.
-        '''
+
         iterint += 1
         if iterint >= lim:
             dprint("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
             print("Breaking loop after " + str(iterint) + " iterations.")
-            print(dg.last_main_model)
             break
+
+    if not dg._found_models:
+        print("UNSATISFIABLE")
+    else:
+        for i, (model, _, cost) in enumerate(dg._found_models):
+            print(f"\nAnswer: {i + 1}")
+            print(model)
+            if cost:
+                print("Optimization:", " ".join(str(c) for c in cost))
     
 if __name__ == '__main__':
     main()
