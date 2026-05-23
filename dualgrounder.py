@@ -194,7 +194,7 @@ class DualGrounder():
             self._found_models.append((self.last_main_model, list(self.last_main_atoms), list(model.cost)))
         else:
             self._invalid_triggered = True
-        return False  # always stop after one model; outer loop handles restart
+        return False
     
     '''
       Used by callback methods to print the solved model.
@@ -262,9 +262,11 @@ class DualGrounder():
     def atom_to_str(self, symbol: clingo.Symbol):
         rule_str = ""
         rule_str += symbol.name
-        rule_str += "("
-        rule_str += (",".join([str(arg) for arg in symbol.arguments]))
-        rule_str += ")."
+        if symbol.arguments:
+            rule_str += "("
+            rule_str += (",".join([str(arg) for arg in symbol.arguments]))
+            rule_str += ")"
+        rule_str += "."
         return rule_str
     
     '''
@@ -365,6 +367,13 @@ def print_answer(index, model, cost):
     print(model)
     if cost:
         print("Optimization:", " ".join(str(c) for c in cost))
+
+def strict_better_bound(cost):
+    if not cost:
+        return None
+    bound = list(cost)
+    bound[-1] -= 1
+    return bound
                
 '''
     DualGrounder first must be given a program to read, which is divided into programs composed of constraint and non-constraint rules.
@@ -475,9 +484,12 @@ def main():
         dg._invalid_triggered = False
         prev_valid_count = len(dg._found_models)
 
-        if iterint != 0:
+        if lastcstr:
             statusprint("Grounding constraints from previous iteration")
             dg.update_mainControl("Iteration_" + str(iterint-1), lastcstr)
+            lastcstr = ""
+        elif iterint != 0:
+            statusprint("Using existing grounding with previous reward blocked")
         else:
             statusprint("Grounding main program")
             dg.mainControl.ground([("base", [])])
@@ -485,8 +497,9 @@ def main():
         # Enforce that subsequent models are at least as good as the best found so far
         if dg._found_models:
             best_cost = dg._found_models[-1][2]
-            if best_cost:
-                dg.mainControl.configuration.solve.opt_mode = "opt," + ",".join(str(c) for c in best_cost)
+            bound = strict_better_bound(best_cost)
+            if bound:
+                dg.mainControl.configuration.solve.opt_mode = "opt," + ",".join(str(c) for c in bound)
 
         dprint("\nMain Solving:")
         statusprint("Solving main candidate")
@@ -501,19 +514,19 @@ def main():
             target = "all" if dg._target == 0 else str(dg._target)
             statusprint(f"Found valid model {len(dg._found_models)}/{target}")
             if args.verbose:
-                model, _, cost = dg._found_models[-1]
-                print_answer(len(dg._found_models), model, cost)
+                for i in range(prev_valid_count, len(dg._found_models)):
+                    model, _, cost = dg._found_models[i]
+                    print_answer(i + 1, model, cost)
             if 0 < dg._target <= len(dg._found_models):
                 break  # collected enough valid models
-            # Need more: block this exact model; opt_bound enforces cost non-regression
-            _, atoms, _ = dg._found_models[-1]
-            lastcstr = ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
-        elif dg._invalid_triggered:
-            # Invalid model: add lazy constraints, re-block all already-found valid models
+
+        if dg._invalid_triggered:
             statusprint(f"Rejected candidate; adding {len(dg.last_grounded_constraints)} lazy constraints")
             lastcstr = dg.build_base_additions()
-            for _, atoms, _ in dg._found_models:
-                lastcstr += ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
+        elif found_new_valid:
+            if not strict_better_bound(dg._found_models[-1][2]):
+                statusprint(f"Search exhausted; found {len(dg._found_models)} valid models")
+                break
         else:
             # No model found — exhausted or UNSAT
             statusprint(f"Search exhausted; found {len(dg._found_models)} valid models")
