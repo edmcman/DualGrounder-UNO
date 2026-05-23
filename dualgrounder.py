@@ -359,6 +359,12 @@ def dprint(message):
 def statusprint(message):
     if args.verbose or args.debugprint:
         print(message)
+
+def print_answer(index, model, cost):
+    print(f"\nAnswer: {index}")
+    print(model)
+    if cost:
+        print("Optimization:", " ".join(str(c) for c in cost))
                
 '''
     DualGrounder first must be given a program to read, which is divided into programs composed of constraint and non-constraint rules.
@@ -461,12 +467,9 @@ def main():
 
         if deadline is not None and time.monotonic() >= deadline:
             print("TIMEOUT")
-            if dg._found_models:
+            if dg._found_models and not args.verbose:
                 for i, (model, _, cost) in enumerate(dg._found_models):
-                    print(f"\nAnswer: {i + 1}")
-                    print(model)
-                    if cost:
-                        print("Optimization:", " ".join(str(c) for c in cost))
+                    print_answer(i + 1, model, cost)
             return
 
         dg._invalid_triggered = False
@@ -497,6 +500,9 @@ def main():
         if found_new_valid:
             target = "all" if dg._target == 0 else str(dg._target)
             statusprint(f"Found valid model {len(dg._found_models)}/{target}")
+            if args.verbose:
+                model, _, cost = dg._found_models[-1]
+                print_answer(len(dg._found_models), model, cost)
             if 0 < dg._target <= len(dg._found_models):
                 break  # collected enough valid models
             # Need more: block this exact model; opt_bound enforces cost non-regression
@@ -523,12 +529,9 @@ def main():
 
     if not dg._found_models:
         print("UNSATISFIABLE")
-    else:
+    elif not args.verbose:
         for i, (model, _, cost) in enumerate(dg._found_models):
-            print(f"\nAnswer: {i + 1}")
-            print(model)
-            if cost:
-                print("Optimization:", " ".join(str(c) for c in cost))
+            print_answer(i + 1, model, cost)
     
 if __name__ == '__main__':
     main()
