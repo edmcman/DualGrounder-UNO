@@ -486,7 +486,7 @@ def main():
         if dg._found_models:
             best_cost = dg._found_models[-1][2]
             if best_cost:
-                dg.mainControl.configuration.solve.opt_bound = ",".join(str(c) for c in best_cost)
+                dg.mainControl.configuration.solve.opt_mode = "opt," + ",".join(str(c) for c in best_cost)
 
         dprint("\nMain Solving:")
         statusprint("Solving main candidate")
