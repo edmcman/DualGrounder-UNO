@@ -355,6 +355,10 @@ class DualGrounder():
 def dprint(message):
     if args.debugprint:
         print(message)
+
+def statusprint(message):
+    if args.verbose or args.debugprint:
+        print(message)
                
 '''
     DualGrounder first must be given a program to read, which is divided into programs composed of constraint and non-constraint rules.
@@ -386,6 +390,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('files', nargs='+', help='The files to process')
     parser.add_argument('--iterlim', nargs='?', default=0, type=int, help='The maximum number of iterations the system may use. Default does not limit the system.')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Print progress status without full debug output.')
     parser.add_argument('--debugprint', action='store_true', default=False, help='Whether or not the system prints runtime data.')
     parser.add_argument('--splitprog', action='store_true', default=False, help='If true, the system will load the first program files into the main grounder and the last into the auxgrounder. Last program should be exclusively constraint rules.')
     parser.add_argument('--wasplike', action='store_true', default=False, help='If true, the system will use wasp-like heuristics for its clingo solving.')
@@ -450,7 +455,7 @@ def main():
     lastcstr = ""
     while True:
         dprint("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        dprint("Iteration " + str(iterint) + ": ")
+        statusprint("Iteration " + str(iterint) + ": ")
         dprint("\nBase Program w/ Additions: ")
         dprint(dg.base + dg.base_additions)
 
@@ -468,8 +473,10 @@ def main():
         prev_valid_count = len(dg._found_models)
 
         if iterint != 0:
+            statusprint("Grounding constraints from previous iteration")
             dg.update_mainControl("Iteration_" + str(iterint-1), lastcstr)
         else:
+            statusprint("Grounding main program")
             dg.mainControl.ground([("base", [])])
 
         # Enforce that subsequent models are at least as good as the best found so far
@@ -479,6 +486,7 @@ def main():
                 dg.mainControl.configuration.solve.opt_bound = ",".join(str(c) for c in best_cost)
 
         dprint("\nMain Solving:")
+        statusprint("Solving main candidate")
         dg.mainControl.solve(on_model=dg.main_callback)
 
         dprint("\nMain Program Answer Set:")
@@ -487,6 +495,8 @@ def main():
         found_new_valid = len(dg._found_models) > prev_valid_count
 
         if found_new_valid:
+            target = "all" if dg._target == 0 else str(dg._target)
+            statusprint(f"Found valid model {len(dg._found_models)}/{target}")
             if 0 < dg._target <= len(dg._found_models):
                 break  # collected enough valid models
             # Need more: block this exact model; opt_bound enforces cost non-regression
@@ -494,11 +504,13 @@ def main():
             lastcstr = ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
         elif dg._invalid_triggered:
             # Invalid model: add lazy constraints, re-block all already-found valid models
+            statusprint(f"Rejected candidate; adding {len(dg.last_grounded_constraints)} lazy constraints")
             lastcstr = dg.build_base_additions()
             for _, atoms, _ in dg._found_models:
                 lastcstr += ":- " + ", ".join(dg.atom_to_str(a).rstrip('.') for a in atoms) + "."
         else:
             # No model found — exhausted or UNSAT
+            statusprint(f"Search exhausted; found {len(dg._found_models)} valid models")
             break
         dprint("\nGenerated constraint program")
         dprint(lastcstr)
@@ -506,7 +518,7 @@ def main():
         iterint += 1
         if iterint >= lim:
             dprint("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-            print("Breaking loop after " + str(iterint) + " iterations.")
+            statusprint("Breaking loop after " + str(iterint) + " iterations.")
             break
 
     if not dg._found_models:
